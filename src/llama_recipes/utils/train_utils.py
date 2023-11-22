@@ -12,6 +12,8 @@ from pkg_resources import packaging
 import torch
 import torch.cuda.nccl as nccl
 import torch.distributed as dist
+import intel_extension_for_pytorch
+import oneccl_bindings_for_pytorch
 from torch.distributed.fsdp import StateDictType
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from tqdm import tqdm
@@ -53,10 +55,11 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     if train_config.use_fp16 and train_config.enable_fsdp:
         scaler = ShardedGradScaler()
     elif train_config.use_fp16 and not train_config.enable_fsdp:
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.xpu.amp.GradScaler()
     if train_config.enable_fsdp:
         world_size = int(os.environ["WORLD_SIZE"])
-    autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
+    autocast = torch.xpu.amp.autocast if train_config.use_fp16 else nullcontext
+    do_profiling = os.environ.get("PROFILE", "OFF").upper() in ["1", "Y", "ON", "YES", "TRUE"]
 
     train_prep = []
     train_loss = []
@@ -74,30 +77,47 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
             total_length = len(train_dataloader)//gradient_accumulation_steps
             pbar = tqdm(colour="blue", desc=f"Training Epoch: {epoch+1}", total=total_length, dynamic_ncols=True)
             for step, batch in enumerate(train_dataloader):
-                for key in batch.keys():
-                    if train_config.enable_fsdp:
-                        batch[key] = batch[key].to(local_rank)
+                if step == 9:
+                    do_profiling = 1
+                # test 10 iterations
+                if step == 10:
+                    break
+                with torch.autograd.profiler_legacy.profile(enabled=do_profiling, use_xpu=True, record_shapes=True) as prof:
+                    start_time = time.time()
+                    for key in batch.keys():
+                        if train_config.enable_fsdp:
+                            batch[key] = batch[key].to("xpu:{}".format(local_rank))
+                        else:
+                            batch[key] = batch[key].to('cuda:0')
+                    with autocast():
+                        loss = model(**batch).loss
+                    loss = loss / gradient_accumulation_steps
+                    total_loss += loss.detach().float()
+                    if train_config.use_fp16:
+                        # if fp16 is enabled, use gradient scaler to handle gradient update
+                        scaler.scale(loss).backward()
+                        if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad()
+                            pbar.update(1)
                     else:
-                        batch[key] = batch[key].to('cuda:0')
-                with autocast():
-                    loss = model(**batch).loss
-                loss = loss / gradient_accumulation_steps
-                total_loss += loss.detach().float()
-                if train_config.use_fp16:
-                    # if fp16 is enabled, use gradient scaler to handle gradient update
-                    scaler.scale(loss).backward()
-                    if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
-                        pbar.update(1)
-                else:
-                    # regular backpropagation when fp16 is not used
-                    loss.backward()
-                    if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        pbar.update(1)
+                        # regular backpropagation when fp16 is not used
+                        loss.backward()
+                        if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                            optimizer.step()
+                            optimizer.zero_grad()
+                            pbar.update(1)
+                    # sync for time measurement
+                    torch.xpu.synchronize("xpu:{}".format(local_rank))
+                    duration_train = time.time() - start_time
+                    print("E2E time: ", duration_train)
+
+                if do_profiling:
+                    torch.save(prof.key_averages().table(sort_by="self_xpu_time_total", row_limit=-1), "./profile_{}.pt".format(local_rank))
+                    torch.save(prof.table(sort_by="id", row_limit=-1),'./profile_{}_id.pt'.format(local_rank))
+                    torch.save(prof.key_averages(group_by_input_shape=True).table(), "./profile_{}_detail.pt".format(local_rank))
+                    prof.export_chrome_trace("./trace.json") 
 
                 pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
             pbar.close()
@@ -105,7 +125,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         epoch_end_time = time.perf_counter()-epoch_start_time
         epoch_times.append(epoch_end_time)
         # Reducing total_loss across all devices if there's more than one CUDA device
-        if torch.cuda.device_count() > 1 and train_config.enable_fsdp:
+        if torch.xpu.device_count() > 1 and train_config.enable_fsdp:
             dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         train_epoch_loss = total_loss / len(train_dataloader)
         if train_config.enable_fsdp:
@@ -115,19 +135,19 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         train_prep.append(train_perplexity)
         train_loss.append(train_epoch_loss)
 
-        if train_config.enable_fsdp:
-            if rank==0:
-                print(f"Max CUDA memory allocated was {memtrace.peak} GB")
-                print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
-                print(f"Peak active CUDA memory was {memtrace.peak_active_gb} GB")
-                print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
-                print(f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB")
-        else:
-            print(f"Max CUDA memory allocated was {memtrace.peak} GB")
-            print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
-            print(f"Peak active CUDA memory was {memtrace.peak_active_gb} GB")
-            print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
-            print(f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB")
+        # if train_config.enable_fsdp:
+        #     if rank==0:
+        #         print(f"Max CUDA memory allocated was {memtrace.peak} GB")
+        #         print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
+        #         print(f"Peak active CUDA memory was {memtrace.peak_active_gb} GB")
+        #         print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
+        #         print(f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB")
+        # else:
+        #     print(f"Max CUDA memory allocated was {memtrace.peak} GB")
+        #     print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
+        #     print(f"Peak active CUDA memory was {memtrace.peak_active_gb} GB")
+        #     print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
+        #     print(f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB")
 
         # Update the learning rate as needed
         lr_scheduler.step()
@@ -283,7 +303,7 @@ def check_frozen_layers_peft_model(model):
 
 def setup():
     """Initialize the process group for distributed training"""
-    dist.init_process_group("nccl")
+    dist.init_process_group("ccl")
 
 
 def setup_environ_flags(rank):

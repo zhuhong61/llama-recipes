@@ -13,9 +13,9 @@ def byte2gb(x):
 class MemoryTrace:
     def __enter__(self):
         gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_max_memory_allocated()  # reset the peak gauge to zero
-        self.begin = byte2gb(torch.cuda.memory_allocated())
+        # torch.cuda.empty_cache()
+        # torch.cuda.reset_max_memory_allocated()  # reset the peak gauge to zero
+        self.begin = byte2gb(torch.xpu.memory_allocated())
         self.process = psutil.Process()
         self.cpu_begin = byte2gb(self.cpu_mem_used())
         self.peak_monitoring = True
@@ -44,17 +44,34 @@ class MemoryTrace:
         self.peak_monitoring = False
 
         gc.collect()
-        torch.cuda.empty_cache()
-        self.end = byte2gb(torch.cuda.memory_allocated())
-        self.peak = byte2gb(torch.cuda.max_memory_allocated())
-        cuda_info = torch.cuda.memory_stats()
-        self.peak_active_gb = byte2gb(cuda_info["active_bytes.all.peak"])
-        self.cuda_malloc_retires = cuda_info.get("num_alloc_retries", 0)
-        self.peak_active_gb = byte2gb(cuda_info["active_bytes.all.peak"])
-        self.m_cuda_ooms = cuda_info.get("num_ooms", 0)
+        # torch.cuda.empty_cache()
+        # self.end = byte2gb(torch.cuda.memory_allocated())
+        # self.peak = byte2gb(torch.cuda.max_memory_allocated())
+        # cuda_info = torch.cuda.memory_stats()
+        # self.peak_active_gb = byte2gb(cuda_info["active_bytes.all.peak"])
+        # self.cuda_malloc_retires = cuda_info.get("num_alloc_retries", 0)
+        # self.peak_active_gb = byte2gb(cuda_info["active_bytes.all.peak"])
+        # self.m_cuda_ooms = cuda_info.get("num_ooms", 0)
+        # self.used = byte2gb(self.end - self.begin)
+        # self.peaked = byte2gb(self.peak - self.begin)
+        # self.max_reserved = byte2gb(torch.cuda.max_memory_reserved())
+
+        torch.xpu.empty_cache()
+        self.end = byte2gb(torch.xpu.memory_allocated())
+        self.peak = byte2gb(torch.xpu.max_memory_allocated())
+        xpu_info = torch.xpu.memory_stats()
+        self.peak_active_gb = byte2gb(xpu_info["active_bytes.all.peak"])
+        self.xpu_malloc_retires = xpu_info.get("num_alloc_retries", 0)
+        self.peak_active_gb = byte2gb(xpu_info["active_bytes.all.peak"])
+        self.m_xpu_ooms = xpu_info.get("num_ooms", 0)
+        
+        print("---xpu_info: ", xpu_info, 
+              "---self.peak_active_gb: ", self.peak_active_gb, 
+              "---self.xpu_malloc_retires: ", self.xpu_malloc_retires,
+              "---self.peak_active_gb: ", self.peak_active_gb)
         self.used = byte2gb(self.end - self.begin)
         self.peaked = byte2gb(self.peak - self.begin)
-        self.max_reserved = byte2gb(torch.cuda.max_memory_reserved())
+        self.max_reserved = byte2gb(torch.xpu.max_memory_reserved())
 
         self.cpu_end = self.cpu_mem_used()
         self.cpu_used = byte2gb(self.cpu_end - self.cpu_begin)
