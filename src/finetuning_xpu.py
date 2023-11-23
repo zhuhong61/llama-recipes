@@ -140,13 +140,15 @@ def main(**kwargs):
     # Convert the model to bfloat16 if fsdp and pure_bf16 is enabled
     if train_config.enable_fsdp and fsdp_config.pure_bf16:
         model.to(torch.bfloat16)
-        
+
     print("----model dtype: ", model.dtype)
 
     print("=======Step 3: get peft model")
     if train_config.use_peft:
         peft_config = generate_peft_config(train_config, kwargs)
         model = get_peft_model(model, peft_config)
+        print("-------train_config: ", train_config)
+        print("-------peft_config: ", peft_config)
         print("-------peft model: ", model)
         model.print_trainable_parameters()
 
@@ -174,6 +176,7 @@ def main(**kwargs):
             # if train_config.low_cpu_fsdp and rank != 0 else None,
         )
         print("------model wrapped by fsdp: ", model)
+        print("----model dtype after fsdp: ", model.dtype)
         print("------fsdp model device: ", model.module.device)
         if fsdp_config.fsdp_activation_checkpointing:
             apply_fsdp_checkpointing(model)
@@ -243,6 +246,10 @@ def main(**kwargs):
             weight_decay=train_config.weight_decay,
         )
     else:
+        # print("----model parameters in AdamW: ", model.parameters())
+        # for name, param in model.named_parameters():
+        #     if param.requires_grad:
+        #         print("-----model.train_parameters()--{}:{}".format(name, ""))
         optimizer = optim.AdamW(
             model.parameters(),
             lr=train_config.lr,

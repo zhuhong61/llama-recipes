@@ -373,7 +373,8 @@ def get_policies(cfg, rank):
 
     # Mixed precision
     if cfg.mixed_precision:
-        bf16_ready = verify_bfloat_support
+        # bf16_ready = verify_bfloat_support
+        bf16_ready = True
 
         if bf16_ready and not cfg.use_fp16:
             mixed_precision_policy = bfSixteen
